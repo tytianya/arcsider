@@ -1,5 +1,8 @@
 const STORAGE_KEY = 'arc_sidebar_tree';
 const PINNED_KEY = 'arc_sidebar_pinned';
+const BACKUP_KEY = 'arc_sidebar_before_import';
+const embedded = window.parent !== window;
+let tabRenderVersion = 0;
 let tree = [];
 let pinnedIds = [];
 let draggedId = null;
@@ -29,10 +32,10 @@ function getList(parentId) {
 
 async function focusOrOpen(url) {
   const normalized = normalizeUrl(url);
-  const targetKey = urlKey(normalized);
+  const targetKey = tabUrlKey(normalized);
   const tabs = await chrome.tabs.query({});
 
-  const match = tabs.find(t => urlKey(t.url) === targetKey);
+  const match = tabs.find(t => tabUrlKey(t.url) === targetKey);
 
   if (match) {
     await chrome.tabs.update(match.id, { active: true });
@@ -45,7 +48,8 @@ async function focusOrOpen(url) {
 // ── Persistence ──
 
 function save() {
-  chrome.storage.local.set({ [STORAGE_KEY]: tree, [PINNED_KEY]: pinnedIds });
+  return chrome.storage.local.set({ [STORAGE_KEY]: tree, [PINNED_KEY]: pinnedIds })
+    .catch(error => showStatus(`保存失败：${error.message}`));
 }
 
 async function load() {
@@ -95,10 +99,13 @@ function renderPinnedGrid() {
     item.draggable = true;
 
     const fav = faviconUrl(node.url);
-    item.innerHTML = `
-      <img src="${fav || ''}" alt="">
-      <span class="pinned-tooltip">${node.title}</span>
-    `;
+    const image = document.createElement('img');
+    image.src = fav || '';
+    image.alt = '';
+    const tooltip = document.createElement('span');
+    tooltip.className = 'pinned-tooltip';
+    tooltip.textContent = node.title;
+    item.append(image, tooltip);
 
     item.addEventListener('click', () => focusOrOpen(node.url));
     item.addEventListener('contextmenu', e => {
@@ -125,11 +132,25 @@ function renderPinnedGrid() {
 // ── Open Tabs ──
 
 async function renderOpenTabs() {
+  const version = ++tabRenderVersion;
   const tabs = await chrome.tabs.query({ currentWindow: true });
+  if (version !== tabRenderVersion) return;
+  const savedKeys = collectLinkKeys(tree);
+  const openKeys = new Set(tabs.map(tab => tabUrlKey(tab.url)));
+  const activeKey = tabUrlKey(tabs.find(tab => tab.active)?.url);
+  document.querySelectorAll('.node-row, .pinned-item').forEach(row => {
+    const node = findNode(tree, row.dataset.id);
+    if (node?.type !== 'link') return;
+    const key = tabUrlKey(node.url);
+    row.classList.toggle('is-open', openKeys.has(key));
+    row.classList.toggle('is-active', activeKey === key);
+    row.title = `${node.title}\n${node.url}${openKeys.has(key) ? '\n已在当前窗口打开' : ''}${activeKey === key ? '（当前标签）' : ''}`;
+  });
   openTabsEl.innerHTML = '';
 
   for (const tab of tabs) {
     if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('chrome-extension://')) continue;
+    if (savedKeys.has(tabUrlKey(tab.url))) continue;
 
     const row = document.createElement('div');
     row.className = 'tab-row';
@@ -138,10 +159,16 @@ async function renderOpenTabs() {
     row.dataset.tabId = tab.id;
 
     const fav = tab.favIconUrl || faviconUrl(tab.url) || '';
-    row.innerHTML = `
-      <span class="icon"><img src="${fav}" alt=""></span>
-      <span class="label">${tab.title || tab.url}</span>
-    `;
+    const icon = document.createElement('span');
+    icon.className = 'icon';
+    const img = document.createElement('img');
+    img.src = fav;
+    img.alt = '';
+    icon.appendChild(img);
+    const label = document.createElement('span');
+    label.className = 'label';
+    label.textContent = tab.title || tab.url;
+    row.append(icon, label);
 
     row.addEventListener('click', () => {
       chrome.tabs.update(tab.id, { active: true });
@@ -167,6 +194,12 @@ async function renderOpenTabs() {
     });
 
     openTabsEl.appendChild(row);
+  }
+  if (!openTabsEl.children.length) {
+    const empty = document.createElement('div');
+    empty.className = 'tabs-empty';
+    empty.textContent = '没有未收藏的标签页';
+    openTabsEl.appendChild(empty);
   }
 }
 
@@ -216,6 +249,7 @@ function renderNode(node, depth) {
 
   // Events
   row.addEventListener('click', e => {
+    if (e.target.closest('input')) return;
     if (node.type === 'folder') {
       node.expanded = node.expanded === false ? true : !node.expanded;
       save();
@@ -426,7 +460,7 @@ contextMenu.addEventListener('click', async e => {
 
     case 'edit-folder':
       hideContextMenu();
-      startInlineEdit(contextTarget, 'name');
+      startInlineEdit(node.id, 'name');
       break;
 
     case 'add-subfolder':
@@ -462,7 +496,7 @@ contextMenu.addEventListener('click', async e => {
 });
 
 function startInlineEdit(nodeId, field = 'name') {
-  const row = document.querySelector(`.node-row[data-id="${nodeId}"]`);
+  const row = [...document.querySelectorAll('.node-row')].find(el => el.dataset.id === nodeId);
   if (!row) return;
   const label = row.querySelector('.label');
   const node = findNode(tree, nodeId);
@@ -479,9 +513,12 @@ function startInlineEdit(nodeId, field = 'name') {
     input.value = node.type === 'folder' ? node.name : node.title;
   }
 
-  const finish = () => {
+  let finished = false;
+  const finish = (cancel = false) => {
+    if (finished) return;
+    finished = true;
     const val = input.value.trim();
-    if (val) {
+    if (!cancel && val) {
       if (field === 'url' && node.type === 'link') {
         node.url = normalizeUrl(val);
       } else if (node.type === 'folder') {
@@ -494,10 +531,13 @@ function startInlineEdit(nodeId, field = 'name') {
     render();
   };
 
-  input.addEventListener('blur', finish);
+  input.addEventListener('click', e => e.stopPropagation());
+  input.addEventListener('pointerdown', e => e.stopPropagation());
+  input.addEventListener('blur', () => finish());
   input.addEventListener('keydown', e => {
-    if (e.key === 'Enter') finish();
-    if (e.key === 'Escape') render();
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); finish(); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(true); }
   });
 
   label.replaceWith(input);
@@ -563,22 +603,12 @@ document.getElementById('import-file').addEventListener('change', e => {
   const reader = new FileReader();
   reader.onload = () => {
     try {
-      const imported = JSON.parse(reader.result);
-      if (Array.isArray(imported)) {
-        tree = imported;
-        pinnedIds = [];
-      } else if (imported.tree) {
-        tree = imported.tree;
-        pinnedIds = imported.pinnedIds || [];
-      } else {
-        throw new Error('Invalid format');
-      }
-      save();
-      render();
-    } catch {
-      alert('Invalid Arcsider JSON file');
+      showBackupPreview(parseBackup(JSON.parse(reader.result)));
+    } catch (error) {
+      showStatus(`未导入，现有收藏未改变：${error.message}`);
     }
   };
+  reader.onerror = () => showStatus('读取文件失败，现有收藏未改变。');
   reader.readAsText(file);
   e.target.value = '';
 });
@@ -728,17 +758,12 @@ function showArcImportForm(arcData) {
       }));
     }
 
-    if (replace) {
-      tree = imported;
-      pinnedIds = autoPin ? allArcPinnedIds : [];
-    } else {
-      tree.push(...imported);
-      if (autoPin) pinnedIds.push(...allArcPinnedIds);
-    }
-
-    save();
-    render();
     close();
+    const candidate = replace
+      ? { tree: imported, pinnedIds: autoPin ? allArcPinnedIds : [] }
+      : { tree: [...tree, ...imported], pinnedIds: [...pinnedIds, ...(autoPin ? allArcPinnedIds : [])] };
+    try { showBackupPreview(parseBackup(candidate)); }
+    catch (error) { showStatus(`未导入，现有收藏未改变：${error.message}`); }
   });
 }
 
@@ -833,6 +858,9 @@ treeEl.addEventListener('drop', e => {
 // ── Tab change listeners ──
 
 chrome.tabs.onUpdated.addListener(() => renderOpenTabs());
+chrome.tabs.onCreated.addListener(() => renderOpenTabs());
+chrome.tabs.onAttached.addListener(() => renderOpenTabs());
+chrome.tabs.onDetached.addListener(() => renderOpenTabs());
 chrome.tabs.onRemoved.addListener(() => renderOpenTabs());
 chrome.tabs.onActivated.addListener(() => renderOpenTabs());
 
@@ -1119,6 +1147,141 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
-// ── Init ──
+function showStatus(message) {
+  const status = document.getElementById('status');
+  status.textContent = message;
+  status.hidden = false;
+}
 
+function showBackupPreview(data, recovery = false) {
+  const overlay = document.createElement('div');
+  overlay.className = 'form-overlay';
+  overlay.innerHTML = `<div class="form-dialog backup-dialog" role="dialog" aria-modal="true" aria-labelledby="backup-title">
+    <div class="form-title" id="backup-title"></div>
+    <p class="backup-summary"></p>
+    <p class="form-hint">确认后替换当前收藏；替换前的数据会保存为本地恢复点。请同时保留原始导出文件。</p>
+    <div class="backup-actions"><button class="form-btn-cancel">取消</button><button class="form-btn-save">确认替换</button></div>
+  </div>`;
+  overlay.querySelector('.form-title').textContent = recovery ? '恢复上次导入前的收藏' : '导入预览';
+  overlay.querySelector('.backup-summary').textContent = `${data.folderCount} 个文件夹，${data.linkCount} 个链接，${data.pinnedIds.length} 个顶部固定项。` +
+    (data.ignoredPinnedCount ? ` 忽略 ${data.ignoredPinnedCount} 个失效或重复的固定引用，收藏链接均保留。` : '');
+  const previousFocus = document.activeElement;
+  const cancel = overlay.querySelector('.form-btn-cancel');
+  const submit = overlay.querySelector('.form-btn-save');
+  let busy = false;
+  const close = () => { if (!busy) { overlay.remove(); previousFocus?.focus(); } };
+  cancel.addEventListener('click', close);
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  overlay.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      (document.activeElement === cancel ? submit : cancel).focus();
+    }
+  });
+  submit.addEventListener('click', async () => {
+    busy = true;
+    submit.disabled = cancel.disabled = true;
+    try {
+      const stored = await chrome.storage.local.get([STORAGE_KEY, PINNED_KEY]);
+      const before = { tree: stored[STORAGE_KEY] || [], pinnedIds: stored[PINNED_KEY] || [], savedAt: new Date().toISOString() };
+      // One storage write: a failed write never replaces the current in-memory tree.
+      await chrome.storage.local.set({ [BACKUP_KEY]: before, [STORAGE_KEY]: data.tree, [PINNED_KEY]: data.pinnedIds });
+      tree = data.tree;
+      pinnedIds = data.pinnedIds;
+      render();
+      busy = false;
+      close();
+      showStatus(`${recovery ? '已恢复' : '已导入'} ${data.folderCount} 个文件夹、${data.linkCount} 个链接。可用 ↶ 恢复替换前的数据。`);
+    } catch (error) {
+      busy = false;
+      submit.disabled = cancel.disabled = false;
+      showStatus(`写入失败，未替换当前收藏：${error.message}`);
+    }
+  });
+  document.body.appendChild(overlay);
+  cancel.focus();
+}
+
+document.getElementById('btn-recover').addEventListener('click', async () => {
+  try {
+    const stored = await chrome.storage.local.get(BACKUP_KEY);
+    if (!stored[BACKUP_KEY]) { showStatus('尚无导入恢复点。导入前请先导出旧插件的数据。'); return; }
+    showBackupPreview(parseBackup(stored[BACKUP_KEY]), true);
+  } catch (error) { showStatus(`无法恢复：${error.message}`); }
+});
+
+// Shared settings apply to both the native panel and the injected drawer.
+const pinButton = document.getElementById('btn-drawer-pin');
+pinButton.hidden = !embedded;
+function updatePin(pinned) {
+  pinButton.setAttribute('aria-pressed', String(pinned));
+  pinButton.title = pinned ? '取消固定，移出后自动收起' : '固定左侧抽屉';
+  pinButton.setAttribute('aria-label', pinButton.title);
+  pinButton.textContent = pinned ? '◆' : '◇';
+}
+pinButton.addEventListener('click', () => {
+  chrome.storage.local.set({ arc_sidebar_drawer_pinned: pinButton.getAttribute('aria-pressed') !== 'true' })
+    .catch(error => showStatus(`固定设置失败：${error.message}`));
+});
+document.addEventListener('keydown', e => {
+  if (embedded && e.key === 'Escape' && !document.querySelector('.form-overlay, .label-input') && contextMenu.classList.contains('hidden')) {
+    window.parent.postMessage({ action: 'arcsider-close' }, '*');
+  }
+});
+
+const resizer = document.getElementById('tabs-resizer');
+let tabsRatio = 40;
+function setTabsRatio(value) {
+  tabsRatio = Math.max(10, Math.min(75, Number(value) || 40));
+  document.documentElement.style.setProperty('--tabs-height', `${tabsRatio}vh`);
+  resizer.setAttribute('aria-valuenow', String(Math.round(tabsRatio)));
+}
+const saveTabsRatio = () => chrome.storage.local.set({ arc_sidebar_tabs_ratio: tabsRatio })
+  .catch(error => showStatus(`布局保存失败：${error.message}`));
+resizer.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  resizer.setPointerCapture(e.pointerId);
+  document.body.classList.add('resizing-tabs');
+});
+resizer.addEventListener('pointermove', e => {
+  if (resizer.hasPointerCapture(e.pointerId)) setTabsRatio((window.innerHeight - e.clientY - 26) / window.innerHeight * 100);
+});
+function endResize(e) {
+  if (!resizer.hasPointerCapture(e.pointerId)) return;
+  resizer.releasePointerCapture(e.pointerId);
+  document.body.classList.remove('resizing-tabs');
+  saveTabsRatio();
+}
+resizer.addEventListener('pointerup', endResize);
+resizer.addEventListener('pointercancel', endResize);
+resizer.addEventListener('keydown', e => {
+  if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+  e.preventDefault();
+  setTabsRatio(e.key === 'Home' ? 10 : e.key === 'End' ? 75 : tabsRatio + (e.key === 'ArrowUp' ? 5 : -5));
+  saveTabsRatio();
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes.arc_sidebar_drawer_pinned) updatePin(changes.arc_sidebar_drawer_pinned.newValue === true);
+  if (changes.arc_sidebar_tabs_ratio) setTabsRatio(changes.arc_sidebar_tabs_ratio.newValue);
+  let changed = false;
+  if (changes[STORAGE_KEY] && JSON.stringify(tree) !== JSON.stringify(changes[STORAGE_KEY].newValue || [])) {
+    tree = changes[STORAGE_KEY].newValue || [];
+    changed = true;
+  }
+  if (changes[PINNED_KEY] && JSON.stringify(pinnedIds) !== JSON.stringify(changes[PINNED_KEY].newValue || [])) {
+    pinnedIds = changes[PINNED_KEY].newValue || [];
+    changed = true;
+  }
+  if (changed) render();
+});
+
+// ── Init ──
+chrome.storage.local.get(['arc_sidebar_drawer_pinned', 'arc_sidebar_tabs_ratio']).then(settings => {
+  updatePin(settings.arc_sidebar_drawer_pinned === true);
+  setTabsRatio(settings.arc_sidebar_tabs_ratio);
+});
 load().then(render);

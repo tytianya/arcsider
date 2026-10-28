@@ -7,9 +7,8 @@ test: ## Run tests (zero dependencies, uses node:test)
 	node --test test/*.test.js
 
 zip: ## Package extension into dist/arcsider.zip
-	@mkdir -p dist
-	@rm -f dist/arcsider.zip
-	zip -r dist/arcsider.zip manifest.json background.js sidepanel.html sidepanel.js sidepanel.css lib.js assets/icons/
+	node scripts/build.js
+	cd dist/arcsider && zip -r ../arcsider.zip .
 
 release: ## Bump version, tag, and push (usage: make release VERSION=1.1.0)
 	@test -n "$(VERSION)" || (echo "Usage: make release VERSION=x.y.z" && exit 1)
