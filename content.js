@@ -8,7 +8,9 @@
     :host { all: initial; position: fixed !important; left: 0 !important; top: 0 !important;
       height: 100dvh !important; width: min(380px, 92vw) !important; z-index: 2147483647 !important;
       transform: translateX(calc(-100% + 5px)); transition: transform 160ms ease;
-      color-scheme: light dark; }
+      color-scheme: light dark; visibility: hidden; }
+    :host([data-ready]) { visibility: visible; }
+    :host([data-pinned]) { transition: none; }
     :host([data-open]) { transform: translateX(0); }
     .edge { position: absolute; right: 0; top: 0; width: 5px; height: 100%;
       background: transparent; cursor: e-resize; }
@@ -30,6 +32,7 @@
   let pinned = false;
   let inside = false;
   let timer;
+  let pinRevision = 0;
   function open() {
     clearTimeout(timer);
     if (!frame.src) frame.src = chrome.runtime.getURL('sidepanel.html?drawer=1');
@@ -59,15 +62,34 @@
     if (e.source !== frame.contentWindow || e.origin !== new URL(chrome.runtime.getURL('/')).origin) return;
     if (e.data?.action === 'arcsider-close' && !pinned) { close(); edge.focus(); }
   });
-  chrome.storage.local.get('arc_sidebar_drawer_pinned').then(result => {
-    pinned = result.arc_sidebar_drawer_pinned === true;
-    if (pinned) open();
-  }).catch(() => {});
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'local' || !changes.arc_sidebar_drawer_pinned) return;
-    pinned = changes.arc_sidebar_drawer_pinned.newValue === true;
+  function applyPin(value) {
+    pinned = value === true;
+    host.toggleAttribute('data-pinned', pinned);
     if (pinned) open();
     else if (!inside) close();
+    host.setAttribute('data-ready', '');
+  }
+  function restorePin() {
+    const revision = pinRevision;
+    chrome.storage.local.get('arc_sidebar_drawer_pinned').then(result => {
+      if (revision === pinRevision) applyPin(result.arc_sidebar_drawer_pinned);
+    }).catch(() => { if (revision === pinRevision) applyPin(false); });
+  }
+  restorePin();
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !changes.arc_sidebar_drawer_pinned) return;
+    pinRevision++;
+    applyPin(changes.arc_sidebar_drawer_pinned.newValue);
   });
-  document.documentElement.appendChild(host);
+  // document_start can precede documentElement; do not wait for the page body/load.
+  if (document.documentElement) document.documentElement.appendChild(host);
+  else {
+    const observer = new MutationObserver(() => {
+      if (!document.documentElement) return;
+      document.documentElement.appendChild(host);
+      observer.disconnect();
+    });
+    observer.observe(document, { childList: true });
+  }
+  window.addEventListener('pageshow', event => { if (event.persisted) restorePin(); });
 })();

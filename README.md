@@ -4,11 +4,19 @@
 
 This enhanced edition builds on [jparrill/arcsider](https://github.com/jparrill/arcsider) with a left-edge hover drawer, a resizable Open Tabs section, live indicators on saved links, light and dark appearance, and import recovery. It retains the original nested folders, drag and drop, pinned shortcuts, and native browser side panel.
 
-**Current version: 1.1.0** · Manifest V3 · No runtime dependencies · MIT licensed
+**Current version: 1.1.1** · Manifest V3 · No runtime dependencies · MIT licensed
 
 [中文安装、使用与迁移说明](USAGE.zh-CN.md)
 
-## What's new in 1.1.0
+## What's new in 1.1.1
+
+- Restore the pinned drawer at document start instead of waiting for page parsing to finish.
+- Skip slide-in animations for pinned drawers and resolve their initial state before revealing the edge trigger.
+- Recheck pinned state when a page is restored from the back/forward cache, and prevent a stale initial storage read from overwriting a newer pin change.
+
+The drawer belongs to each web page. Full navigation still replaces its document and iframe; these changes reduce restoration delay and animation flicker, but do not make the drawer a persistent browser-level surface. Browser new-tab pages remain outside the injection scope.
+
+## Features introduced in 1.1.0
 
 - **Left-edge hover drawer.** Move the pointer to the left edge of a regular web page to slide the sidebar into view. Move away to hide it, or pin the drawer to keep it open. The drawer overlays the page without resizing its layout.
 - **Working folder renaming.** Right-click a folder and choose **Rename**. Enter or blur saves the change; Escape cancels it. Editing a name no longer toggles the folder or submits the edit twice.
